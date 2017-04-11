@@ -801,16 +801,57 @@ void ICACHE_FLASH_ATTR IRrecv::resume() {
   irparams.rawlen = 0;
 }
 
-// Decodes the received IR message
-// Returns true if is data ready
-// Results of decoding are stored in results
-bool ICACHE_FLASH_ATTR IRrecv::decode(decode_results *results) {
-  results->rawbuf = irparams.rawbuf;
-  results->rawlen = irparams.rawlen;
-  results->overflow = irparams.overflow;
+// Make a copy of the interrupt state/data.
+// Needed because irparams is marked as volatile, thus memcpy() isn't allowed.
+// Only call this when you know the interrupt handlers won't modify anything.
+// i.e. In STATE_STOP.
+//
+// Args:
+//   dest: Pointer to an irparams_t structure to copy to.
+void ICACHE_FLASH_ATTR IRrecv::copyIrParams(irparams_t *dest) {
+  // Typecast src and dest addresses to (char *)
+  char *csrc = (char *)&irparams;
+  char *cdest = (char *)dest;
 
+  // Copy contents of src[] to dest[]
+  for (int i=0; i<sizeof(irparams_t); i++)
+    cdest[i] = csrc[i];
+}
+
+// Decodes the received IR message.
+// If the interrupt state is saved, we will immediately resume waiting
+// for the next IR message to avoid missing messages.
+// Note: There is a trade-off here. Saving the state means less time lost until
+// we can receiving the next message vs. using more RAM. Choose appropriately.
+//
+// Args:
+//   results:  A pointer to where the decoded IR message will be stored.
+//   save:  A pointer to an irparams_t instance in which to save
+//          the interrupt's memory/state. NULL means don't save it.
+// Returns:
+//   A boolean indicating if an IR message is ready or not.
+bool ICACHE_FLASH_ATTR IRrecv::decode(decode_results *results,
+                                      irparams_t *save) {
+  // Proceed only if an IR message been received.
   if (irparams.rcvstate != STATE_STOP) {
     return false;
+  }
+
+  bool resummed = false;  // Flag indicating if we have resummed.
+
+  if (save == NULL) {
+    // We haven't been asked to copy it so use the existing memory.
+    results->rawbuf = irparams.rawbuf;
+    results->rawlen = irparams.rawlen;
+    results->overflow = irparams.overflow;
+  } else {
+    copyIrParams(save);  // Duplicate the interrupt's memory.
+    resume();  // It's now safe to rearm. The IR message won't be overridden.
+    resummed = true;
+    // Point the results at the saved copy.
+    results->rawbuf = save->rawbuf;
+    results->rawlen = save->rawlen;
+    results->overflow = save->overflow;
   }
 
 #ifdef DEBUG
@@ -900,7 +941,8 @@ bool ICACHE_FLASH_ATTR IRrecv::decode(decode_results *results) {
     return true;
   }
   // Throw away and start over
-  resume();
+  if (!resummed)  // Check if we have already resummed.
+    resume();
   return false;
 }
 
@@ -914,7 +956,7 @@ bool ICACHE_FLASH_ATTR IRrecv::decodeNEC(decode_results *results) {
   }
   offset++;
   // Check for repeat
-  if (irparams.rawlen == 4 &&
+  if (results->rawlen == 4 &&
     MATCH_SPACE(results->rawbuf[offset], NEC_RPT_SPACE) &&
     MATCH_MARK(results->rawbuf[offset+1], NEC_BIT_MARK)) {
     results->bits = 0;
@@ -922,7 +964,7 @@ bool ICACHE_FLASH_ATTR IRrecv::decodeNEC(decode_results *results) {
     results->decode_type = NEC;
     return true;
   }
-  if (irparams.rawlen < 2 * NEC_BITS + 4) {
+  if (results->rawlen < 2 * NEC_BITS + 4) {
     return false;
   }
   // Initial space
@@ -953,7 +995,7 @@ bool ICACHE_FLASH_ATTR IRrecv::decodeNEC(decode_results *results) {
 
 bool ICACHE_FLASH_ATTR IRrecv::decodeSony(decode_results *results) {
   long data = 0;
-  if (irparams.rawlen < 2 * SONY_BITS + 2) {
+  if (results->rawlen < 2 * SONY_BITS + 2) {
     return false;
   }
   int offset = 0; // Dont skip first space, check its size
@@ -976,7 +1018,7 @@ bool ICACHE_FLASH_ATTR IRrecv::decodeSony(decode_results *results) {
   }
   offset++;
 
-  while (offset + 1 < irparams.rawlen) {
+  while (offset + 1 < results->rawlen) {
     if (!MATCH_SPACE(results->rawbuf[offset], SONY_HDR_SPACE)) {
       break;
     }
@@ -1005,7 +1047,7 @@ bool ICACHE_FLASH_ATTR IRrecv::decodeSony(decode_results *results) {
 bool ICACHE_FLASH_ATTR IRrecv::decodeWhynter(decode_results *results) {
   long data = 0;
 
-  if (irparams.rawlen < 2 * WHYNTER_BITS + 6) {
+  if (results->rawlen < 2 * WHYNTER_BITS + 6) {
      return false;
   }
 
@@ -1063,7 +1105,7 @@ bool ICACHE_FLASH_ATTR IRrecv::decodeWhynter(decode_results *results) {
 // Looks like Sony except for timings, 48 chars of data and time/space different
 bool ICACHE_FLASH_ATTR IRrecv::decodeSanyo(decode_results *results) {
   long data = 0;
-  if (irparams.rawlen < 2 * SANYO_BITS + 2) {
+  if (results->rawlen < 2 * SANYO_BITS + 2) {
     return false;
   }
   int offset = 1; // Skip first space
@@ -1098,7 +1140,7 @@ bool ICACHE_FLASH_ATTR IRrecv::decodeSanyo(decode_results *results) {
   }
   offset++;
 
-  while (offset + 1 < irparams.rawlen) {
+  while (offset + 1 < results->rawlen) {
     if (!MATCH_SPACE(results->rawbuf[offset], SANYO_HDR_SPACE)) {
       break;
     }
@@ -1126,10 +1168,10 @@ bool ICACHE_FLASH_ATTR IRrecv::decodeSanyo(decode_results *results) {
 
 // Looks like Sony except for timings, 48 chars of data and time/space different
 bool ICACHE_FLASH_ATTR IRrecv::decodeMitsubishi(decode_results *results) {
-  // Serial.print("?!? decoding Mitsubishi:");Serial.print(irparams.rawlen);
+  // Serial.print("?!? decoding Mitsubishi:");Serial.print(results->rawlen);
   // Serial.print(" want "); Serial.println( 2 * MITSUBISHI_BITS + 2);
   long data = 0;
-  if (irparams.rawlen < 2 * MITSUBISHI_BITS + 2) {
+  if (results->rawlen < 2 * MITSUBISHI_BITS + 2) {
     return false;
   }
   int offset = 1; // Skip first space
@@ -1161,7 +1203,7 @@ bool ICACHE_FLASH_ATTR IRrecv::decodeMitsubishi(decode_results *results) {
     return false;
   }
   offset++;
-  while (offset + 1 < irparams.rawlen) {
+  while (offset + 1 < results->rawlen) {
     if (MATCH_MARK(results->rawbuf[offset], MITSUBISHI_ONE_MARK)) {
       data = (data << 1) | 1;
     } else if (MATCH_MARK(results->rawbuf[offset], MITSUBISHI_ZERO_MARK)) {
@@ -1233,7 +1275,7 @@ int ICACHE_FLASH_ATTR IRrecv::getRClevel(decode_results *results, int *offset,
 }
 
 bool ICACHE_FLASH_ATTR IRrecv::decodeRC5(decode_results *results) {
-  if (irparams.rawlen < MIN_RC5_SAMPLES + 2) {
+  if (results->rawlen < MIN_RC5_SAMPLES + 2) {
     return false;
   }
   int offset = 1; // Skip gap space
@@ -1244,7 +1286,7 @@ bool ICACHE_FLASH_ATTR IRrecv::decodeRC5(decode_results *results) {
   if (getRClevel(results, &offset, &used, RC5_T1) != SPACE) return false;
   if (getRClevel(results, &offset, &used, RC5_T1) != MARK) return false;
   int nbits;
-  for (nbits = 0; offset < irparams.rawlen; nbits++) {
+  for (nbits = 0; offset < results->rawlen; nbits++) {
     int levelA = getRClevel(results, &offset, &used, RC5_T1);
     int levelB = getRClevel(results, &offset, &used, RC5_T1);
     if (levelA == SPACE && levelB == MARK) {
@@ -1402,7 +1444,7 @@ bool ICACHE_FLASH_ATTR IRrecv::decodeLG(decode_results *results) {
     return false;
   }
   offset++;
-  if (irparams.rawlen < 2 * LG_BITS + 1 ) {
+  if (results->rawlen < 2 * LG_BITS + 1 ) {
     return false;
   }
   // Initial space
@@ -1439,9 +1481,9 @@ bool ICACHE_FLASH_ATTR IRrecv::decodeJVC(decode_results *results) {
   long data = 0;
 	int offset = 1; // Skip first space
   // Check for repeat
-  if (irparams.rawlen - 1 == 33 &&
+  if (results->rawlen - 1 == 33 &&
       MATCH_MARK(results->rawbuf[offset], JVC_BIT_MARK) &&
-      MATCH_MARK(results->rawbuf[irparams.rawlen-1], JVC_BIT_MARK)) {
+      MATCH_MARK(results->rawbuf[results->rawlen-1], JVC_BIT_MARK)) {
     results->bits = 0;
     results->value = REPEAT;
     results->decode_type = JVC;
@@ -1452,7 +1494,7 @@ bool ICACHE_FLASH_ATTR IRrecv::decodeJVC(decode_results *results) {
     return false;
   }
   offset++;
-  if (irparams.rawlen < 2 * JVC_BITS + 1 ) {
+  if (results->rawlen < 2 * JVC_BITS + 1 ) {
     return false;
   }
   // Initial space
@@ -1495,7 +1537,7 @@ bool ICACHE_FLASH_ATTR IRrecv::decodeSAMSUNG(decode_results *results) {
   }
   offset++;
   // Check for repeat
-  if (irparams.rawlen == 4 &&
+  if (results->rawlen == 4 &&
       MATCH_SPACE(results->rawbuf[offset], SAMSUNG_RPT_SPACE) &&
       MATCH_MARK(results->rawbuf[offset+1], SAMSUNG_BIT_MARK)) {
     results->bits = 0;
@@ -1503,7 +1545,7 @@ bool ICACHE_FLASH_ATTR IRrecv::decodeSAMSUNG(decode_results *results) {
     results->decode_type = SAMSUNG;
     return true;
   }
-  if (irparams.rawlen < 2 * SAMSUNG_BITS + 2) {
+  if (results->rawlen < 2 * SAMSUNG_BITS + 2) {
     return false;
   }
   // Initial space
@@ -1538,7 +1580,7 @@ bool ICACHE_FLASH_ATTR IRrecv::decodeDaikin(decode_results *results) {
   long data = 0;
   int offset = 1; // Skip first space
 
-  if (irparams.rawlen < 2 * DAIKIN_BITS + 4) {
+  if (results->rawlen < 2 * DAIKIN_BITS + 4) {
     //return false;
   }
 
@@ -1625,7 +1667,7 @@ bool ICACHE_FLASH_ATTR IRrecv::decodeDenon (decode_results *results) {
 	int offset = 1;  // Skip the Gap reading
 
 	// Check we have the right amount of data
-	if (irparams.rawlen != 1 + 2 + (2 * DENON_BITS) + 1) {
+	if (results->rawlen != 1 + 2 + (2 * DENON_BITS) + 1) {
 	  return false;
 	}
 
